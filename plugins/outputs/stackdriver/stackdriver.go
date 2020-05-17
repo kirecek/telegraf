@@ -19,6 +19,9 @@ import (
 	metricpb "google.golang.org/genproto/googleapis/api/metric"
 	monitoredrespb "google.golang.org/genproto/googleapis/api/monitoredres"
 	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 // Stackdriver is the Google Stackdriver config info.
@@ -106,6 +109,36 @@ func (s *Stackdriver) Connect() error {
 	return nil
 }
 
+func getKubernetesLabels(source string) (map[string]string, error) {
+	labels := make(map[string]string)
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	pods, err := clientset.CoreV1().Pods("").List(metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, pod := range pods.Items {
+		if pod.Status.PodIP == source {
+			labels["cluster_name"] = pod.ClusterName
+			labels["namespace_name"] = pod.Namespace
+			labels["pod_name"] = pod.Name
+			// labels["project_id"] = projectID
+			return labels, nil
+		}
+	}
+	return nil, fmt.Errorf("could not find source pod")
+}
+
 // Sorted returns a copy of the metrics in time ascending order.  A copy is
 // made to avoid modifying the input metric slice since doing so is not
 // allowed.
@@ -148,6 +181,19 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 	batch := sorted(metrics)
 	buckets := make(timeSeriesBuckets)
 	for _, m := range batch {
+
+		if s.ResourceType == "k8s_pod" {
+			source, _ := m.GetTag("source_host")
+			podLabels, err := getKubernetesLabels(source)
+			if err != nil {
+				log.Printf("E! [outputs.stackdriver] get k8s_pod metadata failed: %s", err)
+				continue
+			}
+			for k, v := range podLabels {
+				s.ResourceLabels[k] = v
+			}
+		}
+
 		for _, f := range m.FieldList() {
 			value, err := getStackdriverTypedValue(f.Value)
 			if err != nil {
