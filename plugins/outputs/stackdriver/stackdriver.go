@@ -109,7 +109,7 @@ func (s *Stackdriver) Connect() error {
 	return nil
 }
 
-func getKubernetesLabels(source string) (map[string]string, error) {
+func getKubernetesPodResouceLabels(source string) (map[string]string, error) {
 	labels := make(map[string]string)
 
 	config, err := rest.InClusterConfig()
@@ -184,7 +184,7 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 
 		if s.ResourceType == "k8s_pod" {
 			source, _ := m.GetTag("source_host")
-			podLabels, err := getKubernetesLabels(source)
+			podLabels, err := getKubernetesPodResouceLabels(source)
 			if err != nil {
 				log.Printf("E! [outputs.stackdriver] get k8s_pod metadata failed: %s", err)
 				continue
