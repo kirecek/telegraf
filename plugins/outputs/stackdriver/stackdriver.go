@@ -215,7 +215,7 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 			var startTime, endTime int64 = defaultStartTime, m.Time().Unix()
 			var endTimeNanos int32 = 0
 			if s.CumulativeIntervalSeconds > 0 && metricKind == metricpb.MetricDescriptor_CUMULATIVE {
-				startTime = m.Time().Unix() + (m.Time().Unix() % s.CumulativeIntervalSeconds)
+				startTime = m.Time().Unix() - (m.Time().Unix() % s.CumulativeIntervalSeconds)
 				if endTime == startTime {
 					endTimeNanos = 1000
 				}
