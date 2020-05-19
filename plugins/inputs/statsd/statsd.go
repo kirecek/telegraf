@@ -515,7 +515,7 @@ func (s *Statsd) parser() error {
 				case s.DataDogExtensions && strings.HasPrefix(line, "_e"):
 					s.parseEventMessage(in.Time, line, in.Addr)
 				default:
-					s.parseStatsdLine(line)
+					s.parseStatsdLine(line, in.Addr)
 				}
 			}
 			elapsed := time.Since(start)
@@ -526,7 +526,7 @@ func (s *Statsd) parser() error {
 
 // parseStatsdLine will parse the given statsd line, validating it as it goes.
 // If the line is valid, it will be cached for the next call to Gather()
-func (s *Statsd) parseStatsdLine(line string) error {
+func (s *Statsd) parseStatsdLine(line, addr string) error {
 	s.Lock()
 	defer s.Unlock()
 
@@ -636,6 +636,7 @@ func (s *Statsd) parseStatsdLine(line string) error {
 
 		// Parse the name & tags from bucket
 		m.name, m.field, m.tags = s.parseName(m.bucket)
+		m.tags["source_host"] = addr
 		switch m.mtype {
 		case "c":
 			m.tags["metric_type"] = "counter"
