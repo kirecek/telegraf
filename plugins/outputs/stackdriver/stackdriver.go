@@ -201,14 +201,19 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 	for _, m := range batch {
 
 		if s.ResourceType == "k8s_pod" {
-			source, _ := m.GetTag("source_host")
+			source, _ := m.GetTag("statsd_source_host")
+			m.RemoveTag("statsd_source_host")
+
 			podLabels, err := getKubernetesPodResouceLabels(source)
 			if err != nil {
 				log.Printf("E! [outputs.stackdriver] get k8s_pod metadata failed: %s", err)
 				continue
 			}
 			for k, v := range podLabels {
-				s.ResourceLabels[k] = v
+				// do not override static labels
+				if _, ok := s.ResourceLabels[k]; !ok {
+					s.ResourceLabels[k] = v
+				}
 			}
 		}
 

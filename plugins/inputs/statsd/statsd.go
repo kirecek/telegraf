@@ -636,7 +636,7 @@ func (s *Statsd) parseStatsdLine(line, addr string) error {
 
 		// Parse the name & tags from bucket
 		m.name, m.field, m.tags = s.parseName(m.bucket)
-		m.tags["source_host"] = addr
+		m.tags["statsd_source_host"] = addr
 		switch m.mtype {
 		case "c":
 			m.tags["metric_type"] = "counter"
