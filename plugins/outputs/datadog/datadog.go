@@ -16,8 +16,9 @@ import (
 )
 
 type Datadog struct {
-	Apikey  string
-	Timeout internal.Duration
+	Apikey    string
+	Timeout   internal.Duration
+	Namespace string
 
 	URL    string `toml:"url"`
 	client *http.Client
@@ -86,6 +87,11 @@ func (d *Datadog) Write(metrics []telegraf.Metric) error {
 				} else {
 					dname = m.Name() + "." + fieldName
 				}
+
+				if d.Namespace != "" {
+					dname = fmt.Sprintf("%s.%s", d.Namespace, dname)
+				}
+
 				metric := &Metric{
 					Metric: dname,
 					Tags:   metricTags,
