@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/compute/metadata"
 	monitoring "cloud.google.com/go/monitoring/apiv3" // Imports the Stackdriver Monitoring client package.
 	googlepb "github.com/golang/protobuf/ptypes/timestamp"
 	"github.com/influxdata/telegraf"
@@ -80,7 +81,16 @@ var defaultStartTime = time.Now().Unix()
 // Connect initiates the primary connection to the GCP project.
 func (s *Stackdriver) Connect() error {
 	if s.Project == "" {
-		return fmt.Errorf("Project is a required field for stackdriver output")
+		log.Printf("W! [outputs.stackdriver] Project field not set, trying autodiscovery")
+
+		p, err := metadata.ProjectID()
+		if err != nil {
+			return fmt.Errorf("Project is a required field for stackdriver output")
+		}
+
+		s.Project = p
+
+		log.Printf("I! [outputs.stackdriver] Project set to %s", p)
 	}
 
 	if s.Namespace == "" {
@@ -110,6 +120,7 @@ func (s *Stackdriver) Connect() error {
 }
 
 func getKubernetesPodResouceLabels(source string) (map[string]string, error) {
+	var err error
 	labels := make(map[string]string)
 
 	config, err := rest.InClusterConfig()
@@ -127,15 +138,22 @@ func getKubernetesPodResouceLabels(source string) (map[string]string, error) {
 		return nil, err
 	}
 
+	if labels["location"], err = metadata.Zone(); err != nil {
+		return nil, err
+	}
+
+	if labels["cluster_name"], err = metadata.InstanceAttributeValue("cluster-name"); err != nil {
+		return nil, err
+	}
+
 	for _, pod := range pods.Items {
 		if pod.Status.PodIP == source {
-			labels["cluster_name"] = pod.ClusterName
 			labels["namespace_name"] = pod.Namespace
 			labels["pod_name"] = pod.Name
-			// labels["project_id"] = projectID
 			return labels, nil
 		}
 	}
+
 	return nil, fmt.Errorf("could not find source pod")
 }
 
