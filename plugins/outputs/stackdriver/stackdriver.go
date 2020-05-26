@@ -47,8 +47,10 @@ const (
 	// to string length for label value.
 	QuotaStringLengthForLabelValue = 1024
 
-	// StartTime for cumulative metrics.
-	// StartTime = int64(1)
+	// AlignmentPeriod is the mimal alignment period supported in stackdriver. The value
+	// is used to set time interval for the cumulative metrics.
+	AlignmentPeriod = int64(60)
+
 	// MaxInt is the max int64 value.
 	MaxInt = int(^uint(0) >> 1)
 
@@ -198,11 +200,14 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 
 	batch := sorted(metrics)
 	buckets := make(timeSeriesBuckets)
+
+	endTime := time.Now().Unix()
+	startTime := endTime - AlignmentPeriod
+
 	for _, m := range batch {
 
 		if s.ResourceType == "k8s_pod" {
 			source, _ := m.GetTag("statsd_source_host")
-			m.RemoveTag("statsd_source_host")
 
 			podLabels, err := getKubernetesPodResouceLabels(source)
 			if err != nil {
@@ -234,16 +239,7 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 				continue
 			}
 
-			// timeInterval, err := getStackdriverTimeInterval(metricKind, StartTime, m.Time().Unix())
-			var startTime, endTime int64 = defaultStartTime, m.Time().Unix()
-			var endTimeNanos int32 = 0
-			if s.CumulativeIntervalSeconds > 0 && metricKind == metricpb.MetricDescriptor_CUMULATIVE {
-				startTime = m.Time().Unix() - (m.Time().Unix() % s.CumulativeIntervalSeconds)
-				if endTime == startTime {
-					endTimeNanos = 1000
-				}
-			}
-			timeInterval, err := getStackdriverTimeInterval(metricKind, startTime, 0, endTime, endTimeNanos)
+			timeInterval, err := getStackdriverTimeInterval(metricKind, startTime, endTime)
 			if err != nil {
 				log.Printf("E! [outputs.stackdriver] get time interval failed: %s", err)
 				continue
@@ -326,9 +322,7 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 func getStackdriverTimeInterval(
 	m metricpb.MetricDescriptor_MetricKind,
 	start int64,
-	startNanos int32,
 	end int64,
-	endNanos int32,
 ) (*monitoringpb.TimeInterval, error) {
 	switch m {
 	case metricpb.MetricDescriptor_GAUGE:
@@ -341,11 +335,9 @@ func getStackdriverTimeInterval(
 		return &monitoringpb.TimeInterval{
 			StartTime: &googlepb.Timestamp{
 				Seconds: start,
-				Nanos:   startNanos,
 			},
 			EndTime: &googlepb.Timestamp{
 				Seconds: end,
-				Nanos:   endNanos,
 			},
 		}, nil
 	case metricpb.MetricDescriptor_DELTA, metricpb.MetricDescriptor_METRIC_KIND_UNSPECIFIED:
@@ -414,6 +406,9 @@ func getStackdriverTypedValue(value interface{}) (*monitoringpb.TypedValue, erro
 func getStackdriverLabels(tags []*telegraf.Tag) map[string]string {
 	labels := make(map[string]string)
 	for _, t := range tags {
+		if t.Key == "statsd_source_host" {
+			continue
+		}
 		labels[t.Key] = t.Value
 	}
 	for k, v := range labels {

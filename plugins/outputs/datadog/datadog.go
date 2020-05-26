@@ -19,6 +19,7 @@ type Datadog struct {
 	Apikey    string
 	Timeout   internal.Duration
 	Namespace string
+	Tags      map[string]string `toml:"tags"`
 
 	URL    string `toml:"url"`
 	client *http.Client
@@ -33,6 +34,9 @@ var sampleConfig = `
 
   ## Write URL override; useful for debugging.
   # url = "https://app.datadoghq.com/api/v1/series"
+
+  # [outputs.datadog.tags]
+  # env = production
 `
 
 type TimeSeries struct {
@@ -72,7 +76,14 @@ func (d *Datadog) Write(metrics []telegraf.Metric) error {
 	for _, m := range metrics {
 		if dogMs, err := buildMetrics(m); err == nil {
 			metricTags := buildTags(m.TagList())
+
+			for key, value := range d.Tags {
+				metricTags = append(metricTags, fmt.Sprintf("%s:%s", key, value))
+			}
+
 			host, _ := m.GetTag("host")
+
+			// stackdriver.GetKubernetesPodResouceLabels()
 
 			if len(dogMs) == 0 {
 				continue
