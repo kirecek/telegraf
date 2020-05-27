@@ -8,5 +8,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-w -s" -a -installsuffix cgo -o 
 
 FROM alpine
 RUN apk add ca-certificates
-COPY --from=builder /build/telegraf .
-CMD ["./telegraf"]
+RUN mkdir -p /etc/telegraf/telegraf.d/
+COPY --from=builder /build/telegraf /usr/bin/telegraf
+CMD ["telegraf", "--config-directory", "/etc/telegraf/telegraf.d/"]
