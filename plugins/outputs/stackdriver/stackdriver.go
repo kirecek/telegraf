@@ -33,7 +33,25 @@ type Stackdriver struct {
 	ResourceLabels            map[string]string `toml:"resource_labels"`
 	CumulativeIntervalSeconds int64             `toml:"cumulative_interval_seconds"`
 
-	client *monitoring.MetricClient
+	client      *monitoring.MetricClient
+	gcpMetadata *gcpMetadata
+}
+
+type gcpMetadata struct {
+	// projectID is the identifier of the GCP project associated with this resource, such as "my-project".
+	projectID string
+
+	// instanceID is the numeric VM instance identifier assigned by Compute Engine.
+	instanceID string
+
+	// instanceName is the VM instance string identifier assigned by Compute Engine.
+	instanceName string
+
+	// clusterName is the name for the cluster the container is running in.
+	clusterName string
+
+	// zone is the Compute Engine zone in which the VM is running.
+	zone string
 }
 
 const (
@@ -82,17 +100,25 @@ var defaultStartTime = time.Now().Unix()
 
 // Connect initiates the primary connection to the GCP project.
 func (s *Stackdriver) Connect() error {
-	if s.Project == "" {
-		log.Printf("W! [outputs.stackdriver] Project field not set, trying autodiscovery")
 
-		p, err := metadata.ProjectID()
+	if s.ResourceType != "" || s.ResourceType != "global" {
+		meta, err := retrieveGCPMetadata()
 		if err != nil {
+			log.Printf("I! [outputs.stackdriver] unable to fetch GCP metadata. Not a GCP environment?")
+		}
+		s.gcpMetadata = meta
+	}
+
+	if s.Project == "" {
+		log.Printf("W! [outputs.stackdriver] Project field not set")
+
+		if s.gcpMetadata != nil {
+			s.Project = s.gcpMetadata.projectID
+		} else {
 			return fmt.Errorf("Project is a required field for stackdriver output")
 		}
 
-		s.Project = p
-
-		log.Printf("I! [outputs.stackdriver] Project set to %s", p)
+		log.Printf("I! [outputs.stackdriver] Project set to %s", s.Project)
 	}
 
 	if s.Namespace == "" {
@@ -121,7 +147,36 @@ func (s *Stackdriver) Connect() error {
 	return nil
 }
 
-func getKubernetesPodResouceLabels(source string) (map[string]string, error) {
+func retrieveGCPMetadata() (*gcpMetadata, error) {
+	meta := &gcpMetadata{}
+	var err error
+
+	meta.instanceID, err = metadata.InstanceID()
+	if err != nil {
+		return nil, err
+	}
+
+	meta.instanceName, err = metadata.InstanceName()
+	if err != nil {
+		return nil, err
+	}
+
+	if meta.projectID, err = metadata.ProjectID(); err != nil {
+		return nil, err
+	}
+
+	if meta.zone, err = metadata.Zone(); err != nil {
+		return nil, err
+	}
+
+	if meta.clusterName, err = metadata.InstanceAttributeValue("cluster-name"); err != nil {
+		return nil, err
+	}
+
+	return meta, err
+}
+
+func (s *Stackdriver) retrieveGKEPodResouceLabels(source string) (map[string]string, error) {
 	var err error
 	labels := make(map[string]string)
 
@@ -140,18 +195,14 @@ func getKubernetesPodResouceLabels(source string) (map[string]string, error) {
 		return nil, err
 	}
 
-	if labels["location"], err = metadata.Zone(); err != nil {
-		return nil, err
-	}
-
-	if labels["cluster_name"], err = metadata.InstanceAttributeValue("cluster-name"); err != nil {
-		return nil, err
-	}
-
 	for _, pod := range pods.Items {
 		if pod.Status.PodIP == source {
 			labels["namespace_name"] = pod.Namespace
 			labels["pod_name"] = pod.Name
+			if s.gcpMetadata != nil {
+				labels["cluster_name"] = s.gcpMetadata.clusterName
+				labels["location"] = s.gcpMetadata.zone
+			}
 			return labels, nil
 		}
 	}
@@ -205,20 +256,35 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 	startTime := endTime - AlignmentPeriod
 
 	for _, m := range batch {
+		source, _ := m.GetTag("statsd_source_host")
+
+		resourceLabels := s.ResourceLabels
 
 		if s.ResourceType == "k8s_pod" {
-			source, _ := m.GetTag("statsd_source_host")
-
-			podLabels, err := getKubernetesPodResouceLabels(source)
+			podLabels, err := s.retrieveGKEPodResouceLabels(source)
 			if err != nil {
 				log.Printf("E! [outputs.stackdriver] get k8s_pod metadata failed: %s", err)
 				continue
 			}
 			for k, v := range podLabels {
-				// do not override static labels
-				if _, ok := s.ResourceLabels[k]; !ok {
-					s.ResourceLabels[k] = v
+				if _, ok := resourceLabels[k]; !ok {
+					resourceLabels[k] = v
 				}
+			}
+		}
+
+		if s.ResourceType == "k8s_node" {
+			if _, ok := resourceLabels["cluster_name"]; !ok {
+				resourceLabels["cluster_name"] = s.gcpMetadata.clusterName
+
+			}
+
+			if _, ok := resourceLabels["location"]; !ok {
+				resourceLabels["location"] = s.gcpMetadata.zone
+			}
+
+			if _, ok := resourceLabels["node_name"]; !ok {
+				resourceLabels["node_name"] = s.gcpMetadata.instanceName
 			}
 		}
 
@@ -260,7 +326,7 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 				MetricKind: metricKind,
 				Resource: &monitoredrespb.MonitoredResource{
 					Type:   s.ResourceType,
-					Labels: s.ResourceLabels,
+					Labels: resourceLabels,
 				},
 				Points: []*monitoringpb.Point{
 					dataPoint,
