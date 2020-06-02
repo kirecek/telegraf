@@ -252,9 +252,6 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 	batch := sorted(metrics)
 	buckets := make(timeSeriesBuckets)
 
-	endTime := time.Now().Unix()
-	startTime := endTime - AlignmentPeriod
-
 	for _, m := range batch {
 		source, _ := m.GetTag("statsd_source_host")
 
@@ -305,6 +302,8 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 				continue
 			}
 
+			startTime := time.Now().Unix() - (time.Now().Unix() % AlignmentPeriod)
+			endTime := time.Now().Unix()
 			timeInterval, err := getStackdriverTimeInterval(metricKind, startTime, endTime)
 			if err != nil {
 				log.Printf("E! [outputs.stackdriver] get time interval failed: %s", err)
@@ -390,6 +389,10 @@ func getStackdriverTimeInterval(
 	start int64,
 	end int64,
 ) (*monitoringpb.TimeInterval, error) {
+    endNanos := int32(0)
+    if start == end {
+        endNanos = 1000
+    }
 	switch m {
 	case metricpb.MetricDescriptor_GAUGE:
 		return &monitoringpb.TimeInterval{
@@ -401,9 +404,11 @@ func getStackdriverTimeInterval(
 		return &monitoringpb.TimeInterval{
 			StartTime: &googlepb.Timestamp{
 				Seconds: start,
+                Nanos: 0,   
 			},
 			EndTime: &googlepb.Timestamp{
 				Seconds: end,
+                Nanos: endNanos,
 			},
 		}, nil
 	case metricpb.MetricDescriptor_DELTA, metricpb.MetricDescriptor_METRIC_KIND_UNSPECIFIED:
