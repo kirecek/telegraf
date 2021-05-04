@@ -8,7 +8,9 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
+	"cloud.google.com/go/compute/metadata"
 	monitoring "cloud.google.com/go/monitoring/apiv3" // Imports the Stackdriver Monitoring client package.
 	googlepb "github.com/golang/protobuf/ptypes/timestamp"
 	"github.com/influxdata/telegraf"
@@ -18,16 +20,38 @@ import (
 	metricpb "google.golang.org/genproto/googleapis/api/metric"
 	monitoredrespb "google.golang.org/genproto/googleapis/api/monitoredres"
 	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 // Stackdriver is the Google Stackdriver config info.
 type Stackdriver struct {
-	Project        string
-	Namespace      string
-	ResourceType   string            `toml:"resource_type"`
-	ResourceLabels map[string]string `toml:"resource_labels"`
+	Project                   string
+	Namespace                 string
+	ResourceType              string            `toml:"resource_type"`
+	ResourceLabels            map[string]string `toml:"resource_labels"`
+	CumulativeIntervalSeconds int64             `toml:"cumulative_interval_seconds"`
 
-	client *monitoring.MetricClient
+	client      *monitoring.MetricClient
+	gcpMetadata *gcpMetadata
+}
+
+type gcpMetadata struct {
+	// projectID is the identifier of the GCP project associated with this resource, such as "my-project".
+	projectID string
+
+	// instanceID is the numeric VM instance identifier assigned by Compute Engine.
+	instanceID string
+
+	// instanceName is the VM instance string identifier assigned by Compute Engine.
+	instanceName string
+
+	// clusterName is the name for the cluster the container is running in.
+	clusterName string
+
+	// zone is the Compute Engine zone in which the VM is running.
+	zone string
 }
 
 const (
@@ -41,8 +65,10 @@ const (
 	// to string length for label value.
 	QuotaStringLengthForLabelValue = 1024
 
-	// StartTime for cumulative metrics.
-	StartTime = int64(1)
+	// AlignmentPeriod is the mimal alignment period supported in stackdriver. The value
+	// is used to set time interval for the cumulative metrics.
+	AlignmentPeriod = int64(60)
+
 	// MaxInt is the max int64 value.
 	MaxInt = int(^uint(0) >> 1)
 
@@ -61,6 +87,8 @@ var sampleConfig = `
   ## Custom resource type
   # resource_type = "generic_node"
 
+  # cumulative_interval_seconds = 60
+
   ## Additional resource labels
   # [outputs.stackdriver.resource_labels]
   #   node_id = "$HOSTNAME"
@@ -68,10 +96,29 @@ var sampleConfig = `
   #   location = "eu-north0"
 `
 
+var defaultStartTime = time.Now().Unix()
+
 // Connect initiates the primary connection to the GCP project.
 func (s *Stackdriver) Connect() error {
+
+	if s.ResourceType != "" || s.ResourceType != "global" {
+		meta, err := retrieveGCPMetadata()
+		if err != nil {
+			log.Printf("I! [outputs.stackdriver] unable to fetch GCP metadata. Not a GCP environment?")
+		}
+		s.gcpMetadata = meta
+	}
+
 	if s.Project == "" {
-		return fmt.Errorf("Project is a required field for stackdriver output")
+		log.Printf("W! [outputs.stackdriver] Project field not set")
+
+		if s.gcpMetadata != nil {
+			s.Project = s.gcpMetadata.projectID
+		} else {
+			return fmt.Errorf("Project is a required field for stackdriver output")
+		}
+
+		log.Printf("I! [outputs.stackdriver] Project set to %s", s.Project)
 	}
 
 	if s.Namespace == "" {
@@ -98,6 +145,69 @@ func (s *Stackdriver) Connect() error {
 	}
 
 	return nil
+}
+
+func retrieveGCPMetadata() (*gcpMetadata, error) {
+	meta := &gcpMetadata{}
+	var err error
+
+	meta.instanceID, err = metadata.InstanceID()
+	if err != nil {
+		return nil, err
+	}
+
+	meta.instanceName, err = metadata.InstanceName()
+	if err != nil {
+		return nil, err
+	}
+
+	if meta.projectID, err = metadata.ProjectID(); err != nil {
+		return nil, err
+	}
+
+	if meta.zone, err = metadata.Zone(); err != nil {
+		return nil, err
+	}
+
+	if meta.clusterName, err = metadata.InstanceAttributeValue("cluster-name"); err != nil {
+		return nil, err
+	}
+
+	return meta, err
+}
+
+func (s *Stackdriver) retrieveGKEPodResouceLabels(source string) (map[string]string, error) {
+	var err error
+	labels := make(map[string]string)
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	pods, err := clientset.CoreV1().Pods("").List(metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, pod := range pods.Items {
+		if pod.Status.PodIP == source {
+			labels["namespace_name"] = pod.Namespace
+			labels["pod_name"] = pod.Name
+			if s.gcpMetadata != nil {
+				labels["cluster_name"] = s.gcpMetadata.clusterName
+				labels["location"] = s.gcpMetadata.zone
+			}
+			return labels, nil
+		}
+	}
+
+	return nil, fmt.Errorf("could not find source pod")
 }
 
 // Sorted returns a copy of the metrics in time ascending order.  A copy is
@@ -141,7 +251,40 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 
 	batch := sorted(metrics)
 	buckets := make(timeSeriesBuckets)
+
 	for _, m := range batch {
+		source, _ := m.GetTag("statsd_source_host")
+
+		resourceLabels := s.ResourceLabels
+
+		if s.ResourceType == "k8s_pod" {
+			podLabels, err := s.retrieveGKEPodResouceLabels(source)
+			if err != nil {
+				log.Printf("E! [outputs.stackdriver] get k8s_pod metadata failed: %s", err)
+				continue
+			}
+			for k, v := range podLabels {
+				if _, ok := resourceLabels[k]; !ok {
+					resourceLabels[k] = v
+				}
+			}
+		}
+
+		if s.ResourceType == "k8s_node" {
+			if _, ok := resourceLabels["cluster_name"]; !ok {
+				resourceLabels["cluster_name"] = s.gcpMetadata.clusterName
+
+			}
+
+			if _, ok := resourceLabels["location"]; !ok {
+				resourceLabels["location"] = s.gcpMetadata.zone
+			}
+
+			if _, ok := resourceLabels["node_name"]; !ok {
+				resourceLabels["node_name"] = s.gcpMetadata.instanceName
+			}
+		}
+
 		for _, f := range m.FieldList() {
 			value, err := getStackdriverTypedValue(f.Value)
 			if err != nil {
@@ -159,7 +302,9 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 				continue
 			}
 
-			timeInterval, err := getStackdriverTimeInterval(metricKind, StartTime, m.Time().Unix())
+			startTime := time.Now().Unix() - (time.Now().Unix() % AlignmentPeriod)
+			endTime := time.Now().Unix()
+			timeInterval, err := getStackdriverTimeInterval(metricKind, startTime, endTime)
 			if err != nil {
 				log.Printf("E! [outputs.stackdriver] get time interval failed: %s", err)
 				continue
@@ -180,7 +325,7 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 				MetricKind: metricKind,
 				Resource: &monitoredrespb.MonitoredResource{
 					Type:   s.ResourceType,
-					Labels: s.ResourceLabels,
+					Labels: resourceLabels,
 				},
 				Points: []*monitoringpb.Point{
 					dataPoint,
@@ -244,6 +389,10 @@ func getStackdriverTimeInterval(
 	start int64,
 	end int64,
 ) (*monitoringpb.TimeInterval, error) {
+    endNanos := int32(0)
+    if start == end {
+        endNanos = 1000
+    }
 	switch m {
 	case metricpb.MetricDescriptor_GAUGE:
 		return &monitoringpb.TimeInterval{
@@ -255,9 +404,11 @@ func getStackdriverTimeInterval(
 		return &monitoringpb.TimeInterval{
 			StartTime: &googlepb.Timestamp{
 				Seconds: start,
+                Nanos: 0,   
 			},
 			EndTime: &googlepb.Timestamp{
 				Seconds: end,
+                Nanos: endNanos,
 			},
 		}, nil
 	case metricpb.MetricDescriptor_DELTA, metricpb.MetricDescriptor_METRIC_KIND_UNSPECIFIED:
@@ -326,6 +477,9 @@ func getStackdriverTypedValue(value interface{}) (*monitoringpb.TypedValue, erro
 func getStackdriverLabels(tags []*telegraf.Tag) map[string]string {
 	labels := make(map[string]string)
 	for _, t := range tags {
+		if t.Key == "statsd_source_host" {
+			continue
+		}
 		labels[t.Key] = t.Value
 	}
 	for k, v := range labels {
